@@ -32,6 +32,72 @@ __device__ __forceinline__ void warpReduceSum(T (&vals)[NumVals]) {
   }
 }
 
+struct WelfordData {
+  float mean;
+  float m2;
+  float count;
+};
+
+__device__ __forceinline__ WelfordData welford_combine(WelfordData a, WelfordData b) {
+  if (b.count == 0.0f) return a;
+  if (a.count == 0.0f) return b;
+  float delta = b.mean - a.mean;
+  float count = a.count + b.count;
+  float mean = a.mean + delta * (b.count / count);
+  float m2 = a.m2 + b.m2 + delta * delta * (a.count * b.count / count);
+  return {mean, m2, count};
+}
+
+__device__ __forceinline__ void welford_update(WelfordData& w, float x) {
+  float count = w.count + 1.0f;
+  float delta = x - w.mean;
+  float mean = w.mean + delta / count;
+  float delta2 = x - mean;
+  w.mean = mean;
+  w.m2 += delta * delta2;
+  w.count = count;
+}
+
+__device__ __forceinline__ WelfordData warpReduceWelford(WelfordData w) {
+  unsigned mask = 0xffffffffu;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    WelfordData other;
+    other.mean = __shfl_down_sync(mask, w.mean, offset);
+    other.m2 = __shfl_down_sync(mask, w.m2, offset);
+    other.count = __shfl_down_sync(mask, w.count, offset);
+    w = welford_combine(w, other);
+  }
+  return w;
+}
+
+__device__ __forceinline__ WelfordData blockReduceWelford(WelfordData w) {
+  __shared__ WelfordData shared[32];
+  int lane = threadIdx.x & 31;
+  int wid = threadIdx.x >> 5;
+  w = warpReduceWelford(w);
+  if (lane == 0) {
+    shared[wid] = w;
+  }
+  __syncthreads();
+  if (wid == 0) {
+    int num_warps = (blockDim.x + 31) / 32;
+    WelfordData acc;
+    acc.mean = 0.0f;
+    acc.m2 = 0.0f;
+    acc.count = 0.0f;
+    if (lane < num_warps) {
+      acc = shared[lane];
+    }
+    acc = warpReduceWelford(acc);
+    if (lane == 0) {
+      shared[0] = acc;
+    }
+  }
+  __syncthreads();
+  return shared[0];
+}
+
 template <typename T, int NumVals>
 __device__ __forceinline__ void blockReduceSum(T (&vals)[NumVals]) {
   __shared__ T shared[32][NumVals];  // up to 32 warps (1024 threads)
@@ -46,27 +112,26 @@ __device__ __forceinline__ void blockReduceSum(T (&vals)[NumVals]) {
   }
   __syncthreads();
   if (wid == 0) {
+    int num_warps = (blockDim.x + 31) / 32;
     T acc[NumVals];
 #pragma unroll
     for (int i = 0; i < NumVals; ++i) {
-      acc[i] = T(0);
+      acc[i] = (lane < num_warps) ? shared[lane][i] : T(0);
     }
-    int num_warps = (blockDim.x + 31) / 32;
+    warpReduceSum<T, NumVals>(acc);
 #pragma unroll
-    for (int w = 0; w < 32; ++w) {
-      if (w < num_warps) {
+    if (lane == 0) {
 #pragma unroll
-        for (int i = 0; i < NumVals; ++i) {
-          acc[i] += shared[w][i];
-        }
+      for (int i = 0; i < NumVals; ++i) {
+        shared[0][i] = acc[i];
       }
-    }
-#pragma unroll
-    for (int i = 0; i < NumVals; ++i) {
-      vals[i] = acc[i];
     }
   }
   __syncthreads();
+#pragma unroll
+  for (int i = 0; i < NumVals; ++i) {
+    vals[i] = shared[0][i];
+  }
 }
 
 template <typename T>
@@ -130,6 +195,10 @@ __global__ void norm_scale_fused_kernel(
   __shared__ float s_rstd;
 
   float local_sum[1] = {0.0f};
+  WelfordData local_w;
+  local_w.mean = 0.0f;
+  local_w.m2 = 0.0f;
+  local_w.count = 0.0f;
   Vec4<T> local_val[ITEM_PER_THREAD];
 
 #pragma unroll
@@ -141,48 +210,37 @@ __global__ void norm_scale_fused_kernel(
       local_val[i].fill(T(0));
     }
     if constexpr (kNormType == LayerNorm) {
-      local_sum[0] += vec4_sum(local_val[i]);
+      if (idx < n4) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          welford_update(local_w, static_cast<float>(local_val[i][j]));
+        }
+      }
     } else {
       local_sum[0] += vec4_sum_sq(local_val[i]);
     }
   }
 
-  if (blockDim.x <= 32) {
-    warpReduceSum<float, 1>(local_sum);
-  } else {
-    blockReduceSum<float, 1>(local_sum);
-  }
-
-  if (tid == 0) {
-    if constexpr (kNormType == LayerNorm) {
-      s_mean = local_sum[0] / static_cast<float>(N);
-    } else {
-      s_mean = 0.0f;
-    }
-  }
-  __syncthreads();
-
   if constexpr (kNormType == LayerNorm) {
-    local_sum[0] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; ++i) {
-      int64_t idx = static_cast<int64_t>(i) * blockDim.x + tid;
-      if (idx < n4) {
-        local_sum[0] += vec4_variance_sum(local_val[i], s_mean);
-      }
+    WelfordData total = blockReduceWelford(local_w);
+    if (tid == 0) {
+      s_mean = total.mean;
+      float denom = total.m2 / static_cast<float>(N);
+      s_rstd = rsqrtf(denom + eps);
     }
+    __syncthreads();
+  } else {
     if (blockDim.x <= 32) {
       warpReduceSum<float, 1>(local_sum);
     } else {
       blockReduceSum<float, 1>(local_sum);
     }
+    if (tid == 0) {
+      float denom = local_sum[0] / static_cast<float>(N);
+      s_rstd = rsqrtf(denom + eps);
+    }
+    __syncthreads();
   }
-
-  if (tid == 0) {
-    float denom = local_sum[0] / static_cast<float>(N);
-    s_rstd = rsqrtf(denom + eps);
-  }
-  __syncthreads();
 
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; ++i) {

@@ -91,7 +91,15 @@ def norm_scale_fused(
     elif bias.stride(-1) != 1:
         bias = bias.contiguous()
 
-    item_per_thread = 1 if N <= 4096 else 8
+    if N <= 4096:
+        if N % 16 == 0:
+            item_per_thread = 4
+        elif N % 8 == 0:
+            item_per_thread = 2
+        else:
+            item_per_thread = 1
+    else:
+        item_per_thread = 8
     scale_broadcast = scale2d.shape[0] == 1
     norm_type_val = 0 if norm_type == "layer" else 1
 

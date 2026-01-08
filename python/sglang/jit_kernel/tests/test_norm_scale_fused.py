@@ -54,7 +54,7 @@ def _run_case(norm_type: str):
     else:
         base = _ln_ref(x, weight, bias, eps)
     ref = (base.float() * (scale.float() + add_const)).to(x.dtype)
-    torch.testing.assert_close(out, ref, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
     # Broadcast scale [1, 1, N]
     scale_b = scale[:1].contiguous()
