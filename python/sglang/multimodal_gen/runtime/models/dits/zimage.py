@@ -8,7 +8,11 @@ from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    RMSNormScaleFused,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -225,8 +229,8 @@ class ZImageTransformerBlock(nn.Module):
 
         self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
 
-        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm1 = RMSNormScaleFused(dim, eps=norm_eps)
+        self.ffn_norm1 = RMSNormScaleFused(dim, eps=norm_eps)
 
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
@@ -249,11 +253,15 @@ class ZImageTransformerBlock(nn.Module):
                 1
             ).chunk(4, dim=2)
             gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
-
+            # print("[Debug] Inside ZImageTransformerBlock forward with modulation")
+            # print(f"[Debug] {x.shape=}, {x.dtype}")
+            # print(f"[Debug] {scale_msa.shape=}, {scale_msa.dtype=}")
+            # print(f"[Debug] {scale_mlp.shape=}, {scale_mlp.dtype=}")
+            # print(f"[Debug] {self.attention_norm1.weight.shape=}, {self.attention_norm1.weight.dtype=}")
+            # print(f"[Debug] {self.ffn_norm1.weight.shape=}, {self.ffn_norm1.weight.dtype=}")
             # Attention block
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
+                self.attention_norm1(x, scale=scale_msa, add_const=1.0),
                 freqs_cis=freqs_cis,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
@@ -261,7 +269,7 @@ class ZImageTransformerBlock(nn.Module):
             # FFN block
             x = x + gate_mlp * self.ffn_norm2(
                 self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
+                    self.ffn_norm1(x, scale=scale_mlp, add_const=1.0),
                 )
             )
         else:

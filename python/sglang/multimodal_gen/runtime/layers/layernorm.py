@@ -19,6 +19,13 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
 )
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
+try:
+    from sglang.jit_kernel.norm_scale import norm_scale_fused as _jit_norm_scale_fused
+
+    _HAS_NORM_SCALE_JIT = True
+except Exception:
+    _HAS_NORM_SCALE_JIT = False
+
 
 # Copied and adapted from sglang
 @CustomOp.register("rms_norm")
@@ -222,6 +229,133 @@ class LayerNorm(CustomOp):
         s = f"hidden_size={self.weight.data.size(0)}"
         s += f", eps={self.variance_epsilon}"
         return s
+
+
+class LayerNormScaleFused(LayerNorm):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-5,
+        bias: bool = True,
+        elementwise_affine: bool = True,
+        dtype: torch.dtype = torch.float32,
+        compute_dtype: torch.dtype | None = None,
+    ):
+        super().__init__(
+            hidden_size,
+            elementwise_affine=elementwise_affine,
+            eps=eps,
+            bias=bias,
+            dtype=dtype,
+        )
+        self.compute_dtype = compute_dtype
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        *,
+        add_const: float = 1.0,
+    ) -> torch.Tensor:
+        if scale is None:
+            return super().forward_cuda(x)
+
+        last_dim = x.shape[-1]
+        use_fused = (
+            _HAS_NORM_SCALE_JIT
+            and x.is_cuda
+            and scale.is_cuda
+            and self.weight is not None
+            and self.bias is not None
+            and (last_dim % 4) == 0
+            and self.compute_dtype != torch.float32
+        )
+        if use_fused:
+            return _jit_norm_scale_fused(
+                x,
+                scale,
+                self.weight,
+                self.bias,
+                add_const=add_const,
+                eps=self.eps,
+                norm_type="layer",
+            )
+
+        return self.forward_native(x, scale=scale, add_const=add_const)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        *,
+        add_const: float = 1.0,
+    ) -> torch.Tensor:
+        if scale is None:
+            return super().forward_native(x)
+        if self.compute_dtype == torch.float32:
+            normed = F.layer_norm(
+                x.float(),
+                (self.hidden_size,),
+                self.weight.float() if self.weight is not None else None,
+                self.bias.float() if self.bias is not None else None,
+                self.eps,
+            ).to(x.dtype)
+        else:
+            normed = super().forward_native(x)
+        return normed * (scale + add_const)
+
+
+class RMSNormScaleFused(RMSNorm):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__(hidden_size, eps=eps, dtype=dtype)
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        *,
+        add_const: float = 1.0,
+    ) -> torch.Tensor:
+        if scale is None:
+            return super().forward_cuda(x, residual=None)
+
+        last_dim = x.shape[-1]
+        use_fused = (
+            _HAS_NORM_SCALE_JIT
+            and x.is_cuda
+            and scale.is_cuda
+            and self.weight is not None
+            and (last_dim % 4) == 0
+        )
+        if use_fused:
+            return _jit_norm_scale_fused(
+                x,
+                scale,
+                self.weight,
+                None,
+                add_const=add_const,
+                eps=self.variance_epsilon,
+                norm_type="rms",
+            )
+
+        return self.forward_native(x, scale=scale, add_const=add_const)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        *,
+        add_const: float = 1.0,
+    ) -> torch.Tensor:
+        if scale is None:
+            return super().forward_native(x, residual=None)
+        normed = super().forward_native(x, residual=None)
+        return normed * (scale + add_const)
 
 
 class ScaleResidual(nn.Module):
