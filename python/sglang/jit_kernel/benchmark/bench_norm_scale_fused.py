@@ -64,7 +64,7 @@ def _bench_case(
         )
 
     # Warmup
-    for _ in range(20):
+    for _ in range(2):
         run_naive()
         run_fused()
     torch.cuda.synchronize()
@@ -114,7 +114,7 @@ def main():
     parser.add_argument("--norm-type", choices=["layer", "rms"], default="rms")
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--add-const", type=float, default=1.0)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--iters", type=int, default=2)
     parser.add_argument(
         "--shapes",
         type=str,
